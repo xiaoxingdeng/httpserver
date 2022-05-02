@@ -3,7 +3,9 @@ import os
 import sys
 from time import strftime, gmtime
 from datetime import datetime
+from threading import Thread
 
+MAX_SIZE = 5000000
 SERVER_HOST = 'localhost'
 BUFSIZE = 1024
 text404 = "The file doesn't exist at the server"
@@ -31,26 +33,62 @@ def openserver(Port):
     s.listen(100)
     while True:
         conn, addr = s.accept()
-        data = conn.recv(1024).decode()
-        if len(data) == 0:
-            conn.send(Reponse404())
-        else:
-            response = formResponse(data)
-            conn.send(response)
+        server_thread = Thread(target=newconn, args=(conn,))
+        server_thread.start()
 
 
+def newconn(conn):
+    liveness = True
+    while liveness:
+        try:
+            data = conn.recv(1024).decode()
+            if len(data) == 0:
+                liveness = False
+            else:
+                response = formResponse(data)
+                conn.send(response)
+        except Exception as e:
+            conn.send(Reponse404(False))
+            print(e)
+            liveness = False
+    conn.close()
 
-def formResponse(data):
-    fileposition = getfilename(data)
+
+def formResponse(requestdata):
+    fileposition = getfilename(requestdata)
     if not searchfile(fileposition):
-        return Reponse404()
+        return Reponse404(True)
     if checkSecret(fileposition):
-        return Reponse403()
-    return Response200(fileposition)
+        return Reponse403(True)
+
+    f = open(fileposition, 'rb')
+    data = f.read()
+    f.close()
+    filetype = fileposition.split(".")[1]
+    contentname = "application/octet-stream"
+    if filetype in mediatype:
+        contentname = mediatype.get(filetype)
+    if len(data) <= MAX_SIZE:
+        return Response200(fileposition, data, contentname, True)
+    else:
+        start = checkchunkstart(requestdata)
+        return Response206(start, fileposition, data, contentname, True)
+
+def checkchunkstart(requestdata):
+    splitedrequest = requestdata.splitlines()
+    start = 0
+    for line in splitedrequest:
+        linelist=line.split(": ")
+        if linelist[0] == "Range":
+            range = linelist[1].split("=")
+            ranges = range[1].split("-")
+            start = int(ranges[0])
+            print(start)
+    return start
 
 def getfilename(requestdata):
     splitedrequest = requestdata.splitlines()
-    fileposition = "content"+splitedrequest[0].split(" ")[1]
+    fileposition = "content" + splitedrequest[0].split(" ")[1]
     return fileposition
 
 
@@ -58,19 +96,22 @@ def searchfile(fileposition):
     isExist = os.path.exists(fileposition)
     return isExist
 
+
 def checkSecret(fileposition):
     if "confidential" in fileposition:
         return True
     return False
 
 
-
-def Reponse403():
+def Reponse403(liveness):
     statusline = "HTTP/1.1 403 Forbidden\r\n"
     AcceptRanges = "Accept-Ranges: bytes\r\n"
-    Connection = "Connection: Keep-Alive\r\n"
+    if liveness == True:
+        Connection = "Connection: Keep-Alive\r\n"
+    else:
+        Connection = "Connection: close\r\n"
     ContentLength = "Content-Length: " + str(len(text403)) + "\r\n"
-    ContentRange = "Content-Range: bytes " + contentrange(0, len(text403)-1, len(text403)) + "\r\n"
+    ContentRange = "Content-Range: bytes " + contentrange(0, len(text403) - 1, len(text403)) + "\r\n"
     ContentType = "Content-Type: " + "text/html\r\n"
     Date = "Date: " + httpdate() + "\r\n"
     header = statusline + AcceptRanges + Connection + ContentLength + ContentRange + ContentType + Date + "\r\n"
@@ -78,12 +119,15 @@ def Reponse403():
     return response
 
 
-def Reponse404():
+def Reponse404(liveness):
     statusline = "HTTP/1.1 404 Not Found\r\n"
     AcceptRanges = "Accept-Ranges: bytes\r\n"
-    Connection = "Connection: close\r\n"
+    if liveness == True:
+        Connection = "Connection: Keep-Alive\r\n"
+    else:
+        Connection = "Connection: close\r\n"
     ContentLength = "Content-Length: " + str(len(text404)) + "\r\n"
-    ContentRange = "Content-Range: bytes " + contentrange(0, len(text404)-1, len(text404)) + "\r\n"
+    ContentRange = "Content-Range: bytes " + contentrange(0, len(text404) - 1, len(text404)) + "\r\n"
     ContentType = "Content-Type: " + "text/html\r\n"
     Date = "Date: " + httpdate() + "\r\n"
     header = statusline + AcceptRanges + Connection + ContentLength + ContentRange + ContentType + Date + "\r\n"
@@ -91,24 +135,40 @@ def Reponse404():
     return response
 
 
-def Response200(pathname):
-    f = open(pathname, 'rb')
-    data = f.read()
-    f.close()
+def Response200(pathname, data, contentname ,liveness):
     statusline = "HTTP/1.1 200 OK\r\n"
     AcceptRanges = "Accept-Ranges: bytes\r\n"
-    Connection = "Connection: close\r\n"
+    if liveness == True:
+        Connection = "Connection: Keep-Alive\r\n"
+    else:
+        Connection = "Connection: close\r\n"
     ContentLength = "Content-Length: " + str(len(data)) + "\r\n"
-    ContentRange = "Content-Range: bytes " + contentrange(0, len(data)-1, len(data)) + "\r\n"
-    filetype = pathname.split(".")[1]
-    contentname = "application/octet-stream"
-    if filetype in mediatype:
-        contentname = mediatype.get(filetype)
+    ContentRange = "Content-Range: bytes " + contentrange(0, len(data) - 1, len(data)) + "\r\n"
     ContentType = "Content-Type: " + contentname + "\r\n"
     Date = "Date: " + httpdate() + "\r\n"
     LastModified = "Last-Modified: " + modefieddate(pathname) + "\r\n"
     header = statusline + AcceptRanges + Connection + ContentLength + ContentRange + ContentType + Date + LastModified + "\r\n"
     response = header.encode() + data
+
+    return response
+
+def Response206(start, pathname, data, contentname ,liveness):
+    statusline = "HTTP/1.1 206 Partial Content\r\n"
+    AcceptRanges = "Accept-Ranges: bytes\r\n"
+    if liveness == True:
+        Connection = "Connection: Keep-Alive\r\n"
+    else:
+        Connection = "Connection: close\r\n"
+    end = min(start+MAX_SIZE, len(data))
+    senddata = data[start:end]
+    ContentLength = "Content-Length: " + str(len(senddata)) + "\r\n"
+    ContentRange = "Content-Range: bytes " + contentrange(start, end - 1, len(data)) + "\r\n"
+    ContentType = "Content-Type: " + contentname + "\r\n"
+    Date = "Date: " + httpdate() + "\r\n"
+    LastModified = "Last-Modified: " + modefieddate(pathname) + "\r\n"
+    header = statusline + AcceptRanges + Connection + ContentLength + ContentRange + ContentType + Date + LastModified + "\r\n"
+    response = header.encode() + senddata
+    print(header)
     return response
 
 
